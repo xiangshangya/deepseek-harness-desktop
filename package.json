@@ -1,0 +1,23 @@
+{
+  "name": "dsh-desktop",
+  "productName": "DeepSeek Harness Desktop",
+  "version": "0.1.0",
+  "description": "Electron desktop app for the DeepSeek Harness — bundles the dsh web server and its web frontend.",
+  "main": "main.js",
+  "license": "MIT",
+  "author": "DeepSeek Harness Desktop",
+  "scripts": {
+    "start": "electron .",
+    "start:smoke": "electron . --smoke",
+    "dist": "npm run server:pack && electron-builder --win",
+    "dist:dir": "npm run server:pack && electron-builder --win --dir",
+    "server:pack": "node scripts/pack-server.mjs"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "0.1.0-rc.6"
+  },
+  "devDependencies": {
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3"
+  }
+}

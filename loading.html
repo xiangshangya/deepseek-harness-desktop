@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>DeepSeek Harness</title>
+<style>
+  html, body { height: 100%; margin: 0; background: #0d1117; color: #e6edf3;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  .wrap { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; }
+  .logo { font-size: 20px; font-weight: 600; letter-spacing: 0.3px; }
+  .spinner { width: 34px; height: 34px; border-radius: 50%;
+    border: 3px solid #21262d; border-top-color: #58a6ff;
+    animation: spin 0.9s linear infinite; }
+  .hint { font-size: 13px; color: #8b949e; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="spinner"></div>
+    <div class="logo">DeepSeek Harness</div>
+    <div class="hint" id="hint">starting server…</div>
+  </div>
+</body>
+</html>

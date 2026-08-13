@@ -1,0 +1,61 @@
+# electron-builder configuration for dsh-desktop
+#
+# Key choices:
+#  - asar: false        the DSH server runs as a child Node process; loose files
+#                       keep every file readable by the system/bundled Node.
+#  - npmRebuild: false  node-pty 1.1.0 ships N-API prebuilds (ABI-stable across
+#                       Node and Electron). Rebuilding against Electron's ABI
+#                       would BREAK the server running under a separate Node.
+appId: com.deepseek-ai.dsh-desktop
+productName: DeepSeek Harness Desktop
+directories:
+  output: dist
+  buildResources: build
+# The app shell is tiny (main.js + loading.html). The DSH server runtime is
+# shipped as ONE archive (resources/server.zip, built by `npm run server:pack`)
+# and extracted to real directories on first launch — installing writes a
+# handful of files instead of ~16k, and DSH's plugin loader (profile module
+# fallback junctions) needs real on-disk packages, which asar cannot provide.
+files:
+  - main.js
+  - loading.html
+  - package.json
+  - "!node_modules/**"
+  - "!**/*.pdb"
+  - "!**/*.map"
+asar: false
+npmRebuild: false
+extraResources:
+  - from: resources/node
+    to: node
+    filter:
+      - "**/*"
+  - from: resources/server.zip
+    to: server.zip
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  icon: build/icon.png
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  shortcutName: DeepSeek Harness
+  artifactName: ${productName}-${version}-setup.${ext}
+mac:
+  target:
+    - dmg
+    - zip
+  icon: build/icon.png
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Development
+  icon: build/icon.png
+electronLanguages:
+  - en
+  - zh-CN
