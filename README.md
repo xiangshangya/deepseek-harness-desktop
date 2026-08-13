@@ -89,11 +89,11 @@ Electron 内置 Node**（v43.4.0 内置 Node 24.18.1，满足 DSH 引擎要求�
 
 ```bash
 # 方式 A：源码已构建（pnpm install && pnpm run build 之后）
-set DSH_ROOT=D:\project\DeepseekHarnessApp\deepseek-harness-master\deepseek-harness-master
+set DSH_ROOT=D:\<你的deepseek-harness源码目录>\deepseek-harness-master
 npm start
 
 # 方式 B：未构建的源码（该目录需先 pnpm install，用 tsx 直接跑 TS）
-set DSH_ROOT=D:\project\DeepseekHarnessApp\deepseek-harness-master\deepseek-harness-master
+set DSH_ROOT=D:\<你的deepseek-harness源码目录>\deepseek-harness-master
 set DSH_DESKTOP_PORT=3080
 npm start
 ```
