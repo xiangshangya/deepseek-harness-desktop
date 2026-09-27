@@ -28,9 +28,12 @@
  *   DSH_NODE           force a specific node binary
  */
 
-const { app, BrowserWindow, dialog, Menu, shell } = require('electron')
+const { app, BrowserWindow, dialog, ipcMain, Menu, shell } = require('electron')
 const { spawn, spawnSync, execFileSync } = require('node:child_process')
+const crypto = require('node:crypto')
 const http = require('node:http')
+const https = require('node:https')
+const os = require('node:os')
 const fs = require('node:fs')
 const path = require('node:path')
 
@@ -339,6 +342,7 @@ function createWindow() {
       nodeIntegration: false,
       sandbox: true,
       spellcheck: false,
+      preload: path.join(__dirname, 'preload.js'),
     },
   })
   mainWindow.loadFile(path.join(__dirname, 'loading.html'))
@@ -533,6 +537,8 @@ async function boot() {
     return
   }
   log('server entry: ' + server.note + ' -> ' + server.entry)
+  // Remember what the profile's plugin updates must be driven with later.
+  dshRuntime = { node: runtime.bin, entry: server.entry, env: runtime.env || null }
 
   try {
     const { url, port } = await startServer(runtime, server)
@@ -594,8 +600,18 @@ if (!gotLock) {
 
   app.whenReady().then(() => {
     Menu.setApplicationMenu(null)
+    ipcMain.handle('dsh-desktop:update-status', () => updateState)
+    ipcMain.handle('dsh-desktop:update-open', () => openUpdateFlow())
     if (!SMOKE) createWindow()
     boot()
+    if (!SMOKE) {
+      // Look for a newer release shortly after launch and then rarely; the
+      // client's indicator only appears once a candidate exists (background
+      // checks stay silent, including failures).
+      setTimeout(() => { checkForUpdate({ silent: true }) }, 5000).unref()
+      updateCheckTimer = setInterval(() => { checkForUpdate({ silent: true }) }, UPDATE_CHECK_INTERVAL_MS)
+      updateCheckTimer.unref()
+    }
     if (QUIT_AFTER > 0) {
       log('--quit-after ' + QUIT_AFTER + 'ms armed')
       setTimeout(() => { log('--quit-after elapsed; quitting'); app.quit() }, QUIT_AFTER)
@@ -609,3 +625,461 @@ if (!gotLock) {
   app.on('before-quit', () => { killServerTree() })
   app.on('will-quit', () => { killServerTree() })
 }
+// ---- desktop update carrier -------------------------------------------------
+// The web client renders its own update surface from `window.dshDesktop`
+// (protocol 1, see preload.js) and maps these phases to copy:
+//   idle | checking | available | downloading | verifying | installing | ready | error
+// This shell owns everything behind it: look up the published release, stream
+// the installer with progress, verify it, then quit and hand it to Windows.
+
+const RELEASE_API_URL = process.env.DSH_DESKTOP_RELEASE_API
+  || 'https://api.github.com/repos/xiangshangya/deepseek-harness-desktop/releases/latest'
+const UPDATE_CHECK_INTERVAL_MS = Number(process.env.DSH_DESKTOP_UPDATE_INTERVAL_MS || 6 * 60 * 60 * 1000)
+const UPDATE_FETCH_TIMEOUT_MS = 120000
+
+let updateState = { phase: 'idle' }
+let updateCandidate = null
+let updateCheckTimer = null
+
+function publishUpdateState(next) {
+  // Log phase changes and 10% steps only: progress ticks every 250ms.
+  const step = (value) => (typeof value === 'number' ? Math.floor(value / 10) : null)
+  const noisy = next.phase === updateState.phase && step(next.percent) === step(updateState.percent)
+  updateState = next
+  if (!noisy) log('update: ' + JSON.stringify(next))
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('dsh-desktop:update-state', updateState)
+  }
+}
+
+/** Compare dotted versions; a prerelease ranks below its own release. */
+function compareVersions(left, right) {
+  const parse = (value) => {
+    const [core, pre] = String(value).replace(/^v/i, '').split('-')
+    return { core: core.split('.').map((part) => Number(part) || 0), pre: pre || null }
+  }
+  const a = parse(left)
+  const b = parse(right)
+  for (let i = 0; i < 3; i += 1) {
+    const diff = (a.core[i] || 0) - (b.core[i] || 0)
+    if (diff !== 0) return diff > 0 ? 1 : -1
+  }
+  if (a.pre === b.pre) return 0
+  if (a.pre === null) return 1
+  if (b.pre === null) return -1
+  return a.pre > b.pre ? 1 : -1
+}
+
+/**
+ * GET over Node's own TLS stack, following redirects. Deliberately not the
+ * global `fetch`: inside Electron that goes through Chromium's network service,
+ * which inherits the machine's proxy configuration and fails on GitHub's
+ * release-asset redirects when the system proxy can't tunnel them.
+ */
+function httpGet(url, { headers = {}, redirects = 5 } = {}) {
+  return new Promise((resolve, reject) => {
+    const request = https.get(url, { headers }, (response) => {
+      const location = response.headers.location
+      if (response.statusCode >= 300 && response.statusCode < 400 && location && redirects > 0) {
+        response.resume()
+        resolve(httpGet(new URL(location, url).href, { headers, redirects: redirects - 1 }))
+        return
+      }
+      resolve({ response, statusCode: response.statusCode, headers: response.headers })
+    })
+    request.on('error', (error) => reject(error))
+    request.setTimeout(UPDATE_FETCH_TIMEOUT_MS, () => request.destroy(new Error('request timed out')))
+  })
+}
+
+async function readAll(stream) {
+  const chunks = []
+  for await (const chunk of stream) chunks.push(chunk)
+  return Buffer.concat(chunks)
+}
+
+/** Look up the newest published release, or throw (network flag for copy). */
+async function fetchLatestRelease() {
+  let result
+  try {
+    result = await httpGet(RELEASE_API_URL, {
+      headers: { 'User-Agent': 'dsh-desktop', Accept: 'application/vnd.github+json' },
+    })
+  } catch (error) {
+    error.network = true
+    throw error
+  }
+  const body = await readAll(result.response)
+  if (result.statusCode < 200 || result.statusCode >= 300) {
+    const error = new Error('release lookup failed: HTTP ' + result.statusCode)
+    error.network = true
+    throw error
+  }
+  return JSON.parse(body.toString('utf8'))
+}
+
+/**
+ * Publish available (with candidate) or fall back to idle.
+ * @param silent - Background checks publish nothing until a candidate exists,
+ *   so the client's indicator only ever appears when a newer release is real;
+ *   a failed background check is logged instead of surfacing "重试更新".
+ */
+async function checkForUpdate({ silent = false } = {}) {
+  if (!silent) publishUpdateState({ phase: 'checking' })
+  try {
+    const release = await fetchLatestRelease()
+    const version = String(release.tag_name || release.name || '').replace(/^v/i, '')
+    const assets = Array.isArray(release.assets) ? release.assets : []
+    // Prefer the in-place package: it replaces this app's own files and
+    // relaunches, so no installer runs, no UAC prompt, and no registry or
+    // shortcut churn. Releases that only ship an installer still work.
+    const updateAsset = assets.find((entry) => /-update\.zip$/i.test(entry.name || ''))
+    const setupAsset = assets.find((entry) => /setup(\.[a-z0-9]+)?\.exe$/i.test(entry.name || ''))
+    const asset = updateAsset || setupAsset || assets[0]
+    const current = app.getVersion()
+    if (!version || !asset || !asset.browser_download_url) {
+      if (silent) warn('update check: release has no installer asset')
+      else publishUpdateState({ phase: 'error', failure: 'check' })
+      return null
+    }
+    if (compareVersions(version, current) > 0) {
+      updateCandidate = {
+        version,
+        kind: updateAsset ? 'inplace' : 'installer',
+        name: asset.name || `DeepSeek-Harness-Desktop-${version}-setup.exe`,
+        url: asset.browser_download_url,
+        size: Number(asset.size) || 0,
+        digest: typeof asset.digest === 'string' ? asset.digest : null,
+      }
+      publishUpdateState({ phase: 'available', version })
+      return updateCandidate
+    }
+    updateCandidate = null
+    if (!silent) publishUpdateState({ phase: 'idle' })
+    return null
+  } catch (error) {
+    warn('update check failed: ' + (error && error.message))
+    if (!silent) publishUpdateState({ phase: 'error', failure: error && error.network ? 'check-network' : 'check' })
+    return null
+  }
+}
+
+function updateDownloadPath(candidate) {
+  return path.join(app.getPath('userData'), 'updates', candidate.name)
+}
+
+/**
+ * Direct GitHub plus China-friendly mirrors. Safety comes from the API digest:
+ * whatever source streams the file, its SHA-256 must match the digest GitHub
+ * published before the installer is allowed to run.
+ */
+function updateSourceUrls(url) {
+  const configured = String(process.env.DSH_DESKTOP_UPDATE_MIRRORS || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+  // Measured from this network: gh-proxy.com ~4.4 MB/s, ghfast.top ~130 KB/s,
+  // ghproxy.net ~14 KB/s, direct GitHub throttled to a few KB/s. All of them are
+  // sampled at download time and the fastest wins, so the order only breaks ties.
+  const mirrors = configured.length > 0 ? configured : [
+    'https://gh-proxy.com/',
+    'https://ghfast.top/',
+    'https://ghproxy.net/',
+  ]
+  return [url, ...mirrors.map((prefix) => prefix.replace(/\/+$/, '') + '/' + url)]
+}
+
+/** Rough throughput of one source over a short sample, used to pick the mirror. */
+async function measureSource(url, { sampleBytes = 2 * 1024 * 1024, sampleMs = 6000 } = {}) {
+  const started = Date.now()
+  let received = 0
+  try {
+    const { response, statusCode } = await httpGet(url, { headers: { 'User-Agent': 'dsh-desktop' } })
+    if (statusCode < 200 || statusCode >= 300) {
+      response.resume()
+      return { url, ok: false, speed: 0 }
+    }
+    for await (const chunk of response) {
+      received += chunk.length
+      if (received >= sampleBytes || Date.now() - started > sampleMs) break
+    }
+    response.destroy()
+    const seconds = Math.max(0.5, (Date.now() - started) / 1000)
+    return { url, ok: true, speed: received / seconds }
+  } catch (error) {
+    return { url, ok: false, speed: 0, error }
+  }
+}
+
+/** Stream the installer into userData/updates, publishing percent progress. */
+async function downloadUpdate(candidate) {
+  const file = updateDownloadPath(candidate)
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const sources = updateSourceUrls(candidate.url)
+  let chosen = candidate.url
+  if (sources.length > 1) {
+    publishUpdateState({ phase: 'downloading', version: candidate.version, percent: 0 })
+    const measured = []
+    for (const url of sources) measured.push(await measureSource(url))
+    measured.sort((left, right) => right.speed - left.speed)
+    const fastest = measured.find((entry) => entry.ok) || measured[0]
+    if (fastest && fastest.ok) chosen = fastest.url
+    log('update: sources ' + measured.map((entry) => `${entry.ok ? Math.round(entry.speed / 1024) + 'KB/s' : 'fail'} ${entry.url.slice(0, 48)}`).join(' | '))
+  }
+  let result
+  try {
+    result = await httpGet(chosen, { headers: { 'User-Agent': 'dsh-desktop' } })
+  } catch (error) {
+    error.network = true
+    throw error
+  }
+  const { response, statusCode, headers } = result
+  if (statusCode < 200 || statusCode >= 300) {
+    response.resume()
+    const error = new Error('download failed: HTTP ' + statusCode)
+    error.network = true
+    throw error
+  }
+  const total = Number(headers['content-length']) || candidate.size || 0
+  const out = fs.createWriteStream(file)
+  let received = 0
+  let lastReport = 0
+  for await (const chunk of response) {
+    received += chunk.length
+    out.write(chunk)
+    const now = Date.now()
+    if (now - lastReport > 250) {
+      lastReport = now
+      publishUpdateState({
+        phase: 'downloading',
+        version: candidate.version,
+        percent: total > 0 ? Math.min(99, Math.round((received / total) * 100)) : undefined,
+      })
+    }
+  }
+  await new Promise((resolve, reject) => out.end((error) => (error ? reject(error) : resolve())))
+  publishUpdateState({ phase: 'verifying', version: candidate.version })
+  const size = fs.statSync(file).size
+  if (total > 0 && size !== total) throw new Error(`size mismatch: ${size} != ${total}`)
+  if (candidate.digest && candidate.digest.startsWith('sha256:')) {
+    const hash = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+    if (hash !== candidate.digest.slice(7)) throw new Error('sha256 mismatch')
+  }
+  return file
+}
+
+/** Run a helper process and collect its output (used by both extraction paths). */
+function runProcess(cmd, args, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] })
+    let out = ''
+    child.stdout.on('data', (chunk) => { out += chunk })
+    child.stderr.on('data', (chunk) => { out += chunk })
+    const timer = setTimeout(() => {
+      try { child.kill() } catch { /* ignore */ }
+      resolve({ status: -1, out })
+    }, timeoutMs)
+    child.on('close', (code) => { clearTimeout(timer); resolve({ status: code, out }) })
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      resolve({ status: -2, out: String((error && error.message) || error) })
+    })
+  })
+}
+
+/**
+ * Apply an update package over this app's own files and relaunch.
+ * Nothing else is touched: no installer, no registry, no `~/.dsh`.
+ */
+async function applyInPlaceUpdate(candidate, file) {
+  publishUpdateState({ phase: 'installing', version: candidate.version })
+  killServerTree()
+  const installDir = appCwd()
+  log('update: applying ' + candidate.name + ' over ' + installDir)
+  const result = await runProcess('tar.exe', ['-xf', file, '-C', installDir], 10 * 60 * 1000)
+  if (result.status !== 0) {
+    warn('update: extraction failed (' + result.status + '): ' + String(result.out).slice(-300))
+    publishUpdateState({ phase: 'error', failure: 'install', version: candidate.version })
+    return
+  }
+  log('update: applied; relaunching')
+  app.relaunch()
+  app.exit(0)
+}
+
+/** Quit the shell, then let Windows run the downloaded installer. */
+function installDownloadedUpdate(candidate, file) {
+  publishUpdateState({ phase: 'installing', version: candidate.version })
+  killServerTree()
+  // Launch once this process is on its way out: the installer refuses to touch a
+  // running instance, and a detached child survives our exit. The assisted
+  // installer reads the previous install location from the registry and upgrades
+  // that folder in place.
+  app.once('will-quit', () => {
+    try {
+      const child = spawn(file, [], { detached: true, stdio: 'ignore' })
+      child.unref()
+    } catch (error) {
+      warn('could not launch installer: ' + (error && error.message))
+    }
+  })
+  setTimeout(() => app.quit(), 800).unref()
+}
+
+/**
+ * One click from the page does one step: check → download → apply.
+ * The client's own label ("更新并重启") is the confirmation, so no extra dialog:
+ * the first click downloads, the second applies and restarts.
+ * @returns resolves when the step finishes; the page learns via presentations.
+ */
+async function openUpdateFlow() {
+  if (updateState.phase === 'installing') return
+  try {
+    if (updateState.phase === 'ready' && updateCandidate) {
+      const file = updateDownloadPath(updateCandidate)
+      if (updateCandidate.kind === 'inplace') await applyInPlaceUpdate(updateCandidate, file)
+      else installDownloadedUpdate(updateCandidate, file)
+      return
+    }
+    // Always re-check before downloading: the boot-time candidate may already be
+    // superseded, and the lookup is one cheap request.
+    updateCandidate = null
+    const candidate = await checkForUpdate()
+    if (!candidate) return
+    const file = await downloadUpdate(candidate)
+    // Plugins live in the DSH profile, not in this app: bring them along so one
+    // update click leaves the whole install current. Best effort — a plugin
+    // registry that is slow or offline must not block the app update.
+    try {
+      await updateProfilePlugins()
+    } catch (error) {
+      warn('plugin update skipped: ' + (error && error.message))
+    }
+    publishUpdateState({ phase: 'ready', version: candidate.version })
+    log('update ready: ' + file)
+  } catch (error) {
+    warn('update failed: ' + (error && error.message))
+    publishUpdateState({
+      phase: 'error',
+      failure: updateState.phase === 'downloading' || updateState.phase === 'verifying' ? 'download-network' : 'install',
+      version: updateCandidate ? updateCandidate.version : undefined,
+    })
+  }
+}
+
+// ---- profile plugin updates -------------------------------------------------
+// The profile (`~/.dsh/profiles/web`) owns the third-party plugins; they are
+// updated through the same CLI path the plugin manager uses (`dsh plugin add`),
+// which keeps package.json, the lockfile, and the loader insert rows in sync.
+
+/** Node runtime + server entry resolved at boot, used to drive `dsh plugin`. */
+let dshRuntime = null
+
+function webProfileDir() {
+  const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
+  return path.join(home, 'profiles', 'web')
+}
+
+/** Registry the profile's pnpm resolves against, so lookups match installs. */
+function profileRegistryUrl() {
+  try {
+    const npmrc = fs.readFileSync(path.join(webProfileDir(), '.npmrc'), 'utf8')
+    const match = /^\s*registry\s*=\s*(\S+)/m.exec(npmrc)
+    if (match) return match[1]
+  } catch {
+    /* no profile .npmrc */
+  }
+  return 'https://registry.npmjs.org'
+}
+
+function readProfileDependencies() {
+  try {
+    const json = JSON.parse(fs.readFileSync(path.join(webProfileDir(), 'package.json'), 'utf8'))
+    return json.dependencies || {}
+  } catch {
+    return {}
+  }
+}
+
+function readInstalledVersion(name) {
+  try {
+    const file = path.join(webProfileDir(), 'node_modules', name, 'package.json')
+    return JSON.parse(fs.readFileSync(file, 'utf8')).version || null
+  } catch {
+    return null
+  }
+}
+
+async function readLatestVersion(name, registry) {
+  const base = registry.replace(/\/+$/, '')
+  const url = base + '/' + name.replace('/', '%2f') + '/latest'
+  const { response, statusCode } = await httpGet(url, {
+    headers: { 'User-Agent': 'dsh-desktop', Accept: 'application/json' },
+  })
+  const body = await readAll(response)
+  if (statusCode < 200 || statusCode >= 300) return null
+  return JSON.parse(body.toString('utf8')).version || null
+}
+
+/** Every profile dependency whose registry version is ahead of the installed one. */
+async function outdatedProfilePlugins() {
+  const registry = profileRegistryUrl()
+  const dependencies = readProfileDependencies()
+  const outdated = []
+  for (const name of Object.keys(dependencies)) {
+    const current = readInstalledVersion(name)
+    if (!current) continue
+    let latest = null
+    try {
+      latest = await readLatestVersion(name, registry)
+    } catch (error) {
+      warn('plugin lookup failed for ' + name + ': ' + (error && error.message))
+      continue
+    }
+    if (latest && compareVersions(latest, current) > 0) outdated.push({ name, current, latest })
+  }
+  return outdated
+}
+
+/** Update the outdated profile plugins through the DSH CLI; logs, never throws. */
+async function updateProfilePlugins() {
+  if (!dshRuntime) {
+    warn('plugins: dsh runtime unknown, skipping plugin update')
+    return []
+  }
+  const outdated = await outdatedProfilePlugins()
+  if (outdated.length === 0) {
+    log('plugins: already up to date')
+    return []
+  }
+  const specs = outdated.map((entry) => `${entry.name}@${entry.latest}`)
+  log('plugins: updating ' + specs.join(', '))
+  await new Promise((resolve) => {
+    const child = spawn(dshRuntime.node, [dshRuntime.entry, 'plugin', '--profile', 'web', 'add', ...specs], {
+      cwd: appCwd(),
+      env: { ...process.env, ...(dshRuntime.env || {}) },
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let output = ''
+    child.stdout.on('data', (chunk) => { output += chunk })
+    child.stderr.on('data', (chunk) => { output += chunk })
+    const timer = setTimeout(() => {
+      try { child.kill() } catch { /* ignore */ }
+    }, 10 * 60 * 1000)
+    timer.unref()
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      log('plugins: update finished (exit ' + code + ')' + (code === 0 ? '' : ' :: ' + output.slice(-300)))
+      resolve()
+    })
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      warn('plugins: update failed: ' + (error && error.message))
+      resolve()
+    })
+  })
+  return outdated
+}
+
+// ---- app lifecycle ----------------------------------------------------------

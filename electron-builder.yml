@@ -18,6 +18,7 @@ directories:
 # fallback junctions) needs real on-disk packages, which asar cannot provide.
 files:
   - main.js
+  - preload.js
   - loading.html
   - package.json
   - "!node_modules/**"
