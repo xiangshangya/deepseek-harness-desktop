@@ -5,3 +5,5 @@ out/
 # build artifacts (regenerable: npm run server:pack)
 resources/server.zip
 resources/server-tmp/
+# local backups made before in-place upgrades
+backups/

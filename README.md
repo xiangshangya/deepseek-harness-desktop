@@ -58,7 +58,7 @@ npm run start:smoke
 ## 打包成安装程序（Windows）
 
 ```bash
-npm run dist        # 先构建 resources/server.zip，再产出 dist/DeepSeek Harness Desktop-0.1.0-setup.exe
+npm run dist        # 先构建 resources/server.zip，再产出 dist/DeepSeek Harness Desktop-0.1.1-setup.exe
 ```
 
 产物为 NSIS 安装包，安装后可独立运行。**安装包内已包含 DSH 服务与前端，目标机器
@@ -67,7 +67,7 @@ npm run dist        # 先构建 resources/server.zip，再产出 dist/DeepSeek H
 ### 两段式部署（安装快 + 插件系统兼容）
 
 - 安装包只包含：应用外壳（main.js 等 3 个文件）+ Electron 运行时 + 一个
-  `resources/server.zip`（76MB，由 `npm run server:pack` 把 @deepseek-ai/dsh
+  `resources/server.zip`（118MB，由 `npm run server:pack` 把 @deepseek-ai/dsh
   全依赖树打成单文件归档）。安装时只需写少量文件，**安装速度远快于逐文件解压
   1.5 万个零散小文件**。
 - 首次启动时，应用把 server.zip 解压到

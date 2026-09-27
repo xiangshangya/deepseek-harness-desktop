@@ -1,7 +1,7 @@
 {
   "name": "dsh-desktop",
   "productName": "DeepSeek Harness Desktop",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Electron desktop app for the DeepSeek Harness — bundles the dsh web server and its web frontend.",
   "main": "main.js",
   "license": "MIT",
@@ -14,7 +14,7 @@
     "server:pack": "node scripts/pack-server.mjs"
   },
   "dependencies": {
-    "@deepseek-ai/dsh": "0.1.0-rc.6"
+    "@deepseek-ai/dsh": "0.1.7-rc.2"
   },
   "devDependencies": {
     "electron": "^43.4.0",

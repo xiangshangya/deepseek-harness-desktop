@@ -5,9 +5,11 @@
  *
  * The app starts the real `dsh web` server as a child Node process (the very
  * same runtime you would run from a terminal), waits for its readiness line
- * (`dsh web: http://127.0.0.1:<port>`, emitted after the loader tree settles),
- * then opens the frontend in an Electron window. On quit the server process
- * tree is torn down.
+ * (`dsh web: http://127.0.0.1:<port>/?token=...`, emitted after the loader
+ * tree settles), then opens the frontend in an Electron window. Recent dsh
+ * versions require that bearer token, so the whole printed URL is loaded
+ * verbatim; older versions print it without a token and keep working.
+ * On quit the server process tree is torn down.
  *
  * Runtime resolution order for the server's Node:
  *   1. $DSH_NODE (explicit override)
@@ -146,7 +148,7 @@ function appCwd() {
 
 // Version of the server bundle shipped inside resources/server.zip (kept in
 // sync with scripts/pack-server.mjs). A mismatch triggers a re-extract.
-const SERVER_VERSION = '0.1.0-rc.6'
+const SERVER_VERSION = '0.1.7-rc.2'
 
 function serverDir() {
   return path.join(app.getPath('userData'), 'server')
@@ -312,6 +314,16 @@ let serverChild = null
 let serverUrl = null
 let quitting = false
 
+/** True when `url` addresses the local dsh server we booted (any path/token). */
+function isServerOrigin(url) {
+  if (!serverUrl) return false
+  try {
+    return new URL(url).origin === new URL(serverUrl).origin
+  } catch {
+    return false
+  }
+}
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1360,
@@ -353,7 +365,10 @@ function createWindow() {
     return { action: 'deny' }
   })
   mainWindow.webContents.on('will-navigate', (event, url) => {
-    if (serverUrl && url.startsWith(serverUrl)) return
+    // Match by origin: the SPA drops the one-time ?token= right after boot, so
+    // a prefix comparison against the boot URL would misroute it to the OS
+    // browser.
+    if (isServerOrigin(url)) return
     if (/^https?:\/\//.test(url)) {
       event.preventDefault()
       shell.openExternal(url)
@@ -419,6 +434,9 @@ function startServer(runtime, server) {
     } else {
       args.push('web', '--port', port)
     }
+    // dsh >= 0.1.5 opens the Web UI in the default browser unless told
+    // otherwise; this shell *is* the browser, so never spawn an external one.
+    args.push('--no-open')
     log('spawning server: ' + runtime.bin + ' ' + args.join(' '))
     const child = spawn(runtime.bin, args, {
       cwd: server.cwd,
@@ -441,12 +459,17 @@ function startServer(runtime, server) {
       safeOut(chunk)
       writeLog(chunk)
       buffer += chunk.toString()
-      const m = /dsh web: http:\/\/127\.0\.0\.1:(\d+)/.exec(buffer)
+      // dsh >= 0.1.5 emits `dsh web: http://127.0.0.1:<port>/?token=<token>`
+      // and rejects unauthenticated requests, so the tokenized URL is what the
+      // window must load. Older builds print a bare URL; both match here.
+      const m = /dsh web: (http:\/\/127\.0\.0\.1:\d+(?:\/\S*)?)/.exec(buffer)
       if (m && !settled) {
         settled = true
         clearTimeout(timer)
-        const url = 'http://127.0.0.1:' + m[1]
-        resolve({ url, port: Number(m[1]) })
+        const url = m[1]
+        let resolvedPort = 0
+        try { resolvedPort = Number(new URL(url).port) } catch { /* keep 0 */ }
+        resolve({ url, port: resolvedPort })
       }
     })
     child.stderr.on('data', (chunk) => {
@@ -512,9 +535,10 @@ async function boot() {
   log('server entry: ' + server.note + ' -> ' + server.entry)
 
   try {
-    const { url } = await startServer(runtime, server)
+    const { url, port } = await startServer(runtime, server)
     serverUrl = url
-    log('server ready: ' + url)
+    // Log the origin only: the URL carries a one-time bearer token.
+    log('server ready on http://127.0.0.1:' + port)
     // Extra readiness: the SPA should answer 200 at the root before we load it.
     const ready = await waitForHttp(url, HTTP_READY_TIMEOUT_MS)
     if (!ready) warn('server answered its readiness line but HTTP did not respond in time; loading anyway')

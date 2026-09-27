@@ -13,7 +13,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const appDir = join(here, '..')
 const tmp = join(appDir, 'resources', 'server-tmp')
 const zip = join(appDir, 'resources', 'server.zip')
-const SERVER_PKG = process.env.DSH_DESKTOP_SERVER_PKG || '@deepseek-ai/dsh@0.1.0-rc.6'
+const SERVER_PKG = process.env.DSH_DESKTOP_SERVER_PKG || '@deepseek-ai/dsh@0.1.7-rc.2'
 
 const reuseTmp = process.env.DSH_DESKTOP_SKIP_INSTALL === '1' && existsSync(join(tmp, 'node_modules'))
 if (reuseTmp) {
